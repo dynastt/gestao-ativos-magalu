@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Auto Ativos — Magalu",
+  "version": "13.0",
+  "description": "Automação de ativos Magalu",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": [
+    "https://gestaoativos.magazineluiza.com.br/*",
+    "https://gestao-ativos-api.magazineluiza.com.br/*",
+    "https://script.google.com/*",
+    "https://script.googleusercontent.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://gestaoativos.magazineluiza.com.br/*"],
+      "js": ["injector.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://gestaoativos.magazineluiza.com.br/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
