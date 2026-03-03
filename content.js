@@ -40,64 +40,25 @@ const S={running:false,stop:false,jobs:[],results:{},sentItems:[],sepFiliais:[],
   nfeOk:false,nfeSucess:[],nfeFail:[],startTime:null,modo:null};
 function setRes(f,p,status,motivo='',qtd=0){S.results[norm(f)+'::'+p.toUpperCase().trim()]={f:norm(f),p:p.toUpperCase().trim(),status,motivo,qtd};}
 
-// ═══ TOKEN REFRESH ═════════════════════════════════════
-let _refreshing=false;
-async function ensureToken(){
-  const m=tokMins();
-  if(_tok && m!==null && m>3) return;
-  if(_refreshing){await sleep(2000);return;}
-  _refreshing=true;
-  const wasNull=!_tok;
-  if(!wasNull) log('⏳ Token expirando — renovando automaticamente...','warn');
-  try{
-    // Tenta fetch na própria página pra forçar interceptors do framework renovarem o token
-    const navLinks=document.querySelectorAll('a[href*="expedicao"], a[href*="expedition"], a[href*="recebimento"], nav a, .sidebar a, [class*="nav"] a, [class*="menu"] a');
-    let clicked=false;
-    for(const link of navLinks){
-      if(link.offsetParent!==null){
-        const href=link.getAttribute('href');
-        if(href && !href.startsWith('http') && !href.startsWith('#')){
-          try{await fetch(window.location.origin+href,{credentials:'include'});}catch(_){}
-          clicked=true;break;
-        }
-      }
-    }
-    if(!clicked){try{await fetch(window.location.href,{credentials:'include'});}catch(_){}}
-    // Espera até 12s pelo novo token
-    const deadline=Date.now()+12000;
-    while(Date.now()<deadline){
-      syncTok();
-      const nm=tokMins();
-      if(_tok && nm!==null && nm>3){if(!wasNull)log('✓ Token renovado!','ok');_refreshing=false;uiToken();return;}
-      await sleep(700);
-    }
-    // Não conseguiu automaticamente — pede ao usuário sem travar
-    log('⚠ Renovação automática falhou. Clique em qualquer menu do site.','warn');
-    const action=await modal({tipo:'warn',icone:'🔐',titulo:'Renove o token',
-      mensagem:'O token está prestes a expirar.\n\nClique em qualquer opção do menu do site (Expedição, Recebimento, etc.) e volte aqui.\n\nO processo continuará automaticamente.',
-      btns:[{t:'Já renovei',v:'ok',cls:'p'},{t:'Cancelar processo',v:'cancel',cls:'d'}]});
-    if(action==='cancel'){_refreshing=false;throw new Error('Processo cancelado: token expirado');}
-    syncTok();
-    const dl2=Date.now()+8000;
-    while(Date.now()<dl2){syncTok();if(_tok && tokMins()>1)break;await sleep(500);}
-  }catch(e){
-    if(e.message.includes('cancelado')){_refreshing=false;throw e;}
-  }
-  _refreshing=false;uiToken();
+// ═══ API ══════════════════════════════════════════════
+async function _refreshOn401(){
+  log('Token expirou (401) — renovando...','warn');
+  const lnk=document.querySelectorAll('nav a,.sidebar a,[class*="nav"] a,[class*="menu"] a');
+  for(const a of lnk){if(a.offsetParent!==null){const h=a.getAttribute('href');if(h&&!h.startsWith('http')&&!h.startsWith('#')){try{await fetch(window.location.origin+h,{credentials:'include'});}catch(_){}break;}}}
+  try{await fetch(window.location.href,{credentials:'include'});}catch(_){}
+  const dl=Date.now()+8000;
+  while(Date.now()<dl){syncTok();const m=tokMins();if(_tok&&m!==null&&m>1){log('Token renovado!','ok');uiToken();return;}await sleep(600);}
+  log('Renovação automática não confirmada — retentando...','warn');
+  syncTok();
 }
 
-// ═══ API ══════════════════════════════════════════════
 async function req(method,ep,body=null,retry=0){
-  await ensureToken();
   const auth=getTok();
   if(!auth)throw new Error('Token não capturado — faça qualquer ação no site.');
   const res=await fetch(C.API+ep,{method,headers:{'Content-Type':'application/json','Authorization':auth},body:body?JSON.stringify(body):null});
   if(res.status>=200&&res.status<300){const t=await res.text();return t?JSON.parse(t):{};}
   if(res.status===404)return null;
-  if(res.status===401&&retry<C.RET){
-    log(`Token expirou (401) — renovando... (${retry+1}/${C.RET})`,'warn');
-    _tok=null;await ensureToken();return req(method,ep,body,retry+1);
-  }
+  if(res.status===401&&retry<C.RET){await _refreshOn401();return req(method,ep,body,retry+1);}
   const e=await res.text().catch(()=>'');throw new Error(`HTTP ${res.status}: ${e.slice(0,120)}`);
 }
 const yr=()=>new Date().getFullYear();
@@ -471,14 +432,6 @@ function buildPanel(){
   });
 
   setInterval(uiToken,8000);
-  // Background: checa token a cada 60s e renova se < 5min
-  setInterval(async()=>{
-    if(S.running) return;
-    const m=tokMins();
-    if(_tok && m!==null && m<5 && m>0 && !_refreshing){
-      try{await ensureToken();}catch(_){}
-    }
-  },60000);
 }
 
 function uiToken(){
@@ -487,7 +440,7 @@ function uiToken(){
   if(!el||!tx)return;
   if(!getTok()){el.className='aat w';tx.textContent='Aguardando token — faça qualquer ação no site';return;}
   const m=tokMins();
-  if(m!==null&&m<5){el.className='aat ex';tx.textContent=`Token expirando em ${m}min — renove agora`;}
+  if(m!==null&&m<2){el.className='aat ex';tx.textContent=`Token expirando em ${m}min — renove agora`;}
   else{el.className='aat ok';tx.textContent=m!==null?`Token ativo · ${m} min restantes`:'Token ativo';}
 }
 
@@ -889,12 +842,10 @@ async function stepConferencia(){
   const lid=S.cargaId;
   const ci=await A.filsCarga(lid);if(!ci){log('Sem info da carga.','err');return;}
   const isCorr=ci.freightType==='CORREIOS';
-  const filsRaw=[];
-  const seenBranch=new Set();
-  for(const s of(ci.stockCd||[]))for(const b of(s.branches||[])){const id=b.number||b.branchId;if(id&&b.status==='PENDING'){const nid=String(id).replace(/\D/g,'').replace(/^0+/,'')||'0';if(!seenBranch.has(nid)){seenBranch.add(nid);filsRaw.push({branchId:id});}}}
+  const fils=[];const _seen=new Set();
+  for(const s of(ci.stockCd||[]))for(const b of(s.branches||[])){const id=b.number||b.branchId;if(id&&b.status==='PENDING'){const _n=String(id).replace(/\D/g,'').replace(/^0+/,'')||'0';if(!_seen.has(_n)){_seen.add(_n);fils.push({branchId:id});}}}
   const ord=S.jobs.map(j=>norm(j.filial));
-  filsRaw.sort((a,b)=>{const ia=ord.indexOf(norm(a.branchId)),ib=ord.indexOf(norm(b.branchId));return(ia<0?9999:ia)-(ib<0?9999:ib);});
-  const fils=filsRaw;
+  fils.sort((a,b)=>{const ia=ord.indexOf(norm(a.branchId)),ib=ord.indexOf(norm(b.branchId));return(ia<0?9999:ia)-(ib<0?9999:ib);});
   if(!fils.length){log('Sem filiais pendentes.','info');return;}
   log(`${fils.length} filial(is) para conferir.`,'info');
   if(isCorr){
@@ -928,7 +879,7 @@ async function stepConferencia(){
       for(const g of its)for(const item of(g.items||[]))for(const asset of(item.separatedAssets||[])){
         if(S.stop)break;const aid=asset.assetId;if(!aid)continue;
         let rt=0,ok=false;
-        while(rt<C.RET&&!ok){try{await A.conferir(lid,aid,isCorr?(S.tracks[branchId]||''):'');c++;tot++;ok=true;}catch(e2){if(e2.message&&e2.message.includes('409')){log(`Ativo ${aid}: já conferido (ok)`,'info');c++;tot++;ok=true;}else{rt++;if(rt>=C.RET){e++;errs++;log(`Erro ativo ${aid}: ${e2.message}`,'err');}else await sleep(C.RD);}}}
+        while(rt<C.RET&&!ok){try{await A.conferir(lid,aid,isCorr?(S.tracks[branchId]||''):'');c++;tot++;ok=true;}catch(e2){if(e2.message&&e2.message.includes('409')){log(`Ativo ${aid}: ja conferido (ok)`,'info');c++;tot++;ok=true;}else{rt++;if(rt>=C.RET){e++;errs++;log(`Erro ativo ${aid}: ${e2.message}`,'err');}else await sleep(C.RD);}}}
         await sleep(150);
       }
       e>0?S.confFilErr.push(branchId):S.confFilOk.push(branchId);
@@ -1025,7 +976,7 @@ async function testarEmails(){
   if(idx===null)return;
   const ch=cs[idx];S.cargaId=ch.id;S.freight=ch.freightType;S.depDate=ch.departureDate||ch.date||'';
   const ci=await A.filsCarga(ch.id);
-  let fils=[];for(const s of(ci?.stockCd||[]))for(const b of(s.branches||[])){const id=b.number||b.branchId;if(id){const nid=String(id).replace(/\D/g,'').replace(/^0+/,'')||'0';fils.push(nid);}}fils=[...new Set(fils)];
+  let fils=[];for(const s of(ci?.stockCd||[]))for(const b of(s.branches||[])){const id=b.number||b.branchId;if(id){const _n=String(id).replace(/\D/g,'').replace(/^0+/,'')||'0';fils.push(_n);}}fils=[...new Set(fils)];
   if(!fils.length){log('Sem filiais.','warn');return;}
   const ipf={};
   for(const f of fils){try{const its=await A.itensBranch(ch.id,f);const lst=[];if(its?.length)for(const g of its)for(const it of(g.items||[]))lst.push({produto:it.itemName||it.description||'Produto',qtd:(it.separatedAssets||[]).length||1});ipf[f]=lst;}catch{ipf[f]=[];}}
