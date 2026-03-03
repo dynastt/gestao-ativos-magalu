@@ -48,8 +48,11 @@ async function _refreshOn401(){
   try{await fetch(window.location.href,{credentials:'include'});}catch(_){}
   const dl=Date.now()+8000;
   while(Date.now()<dl){syncTok();const m=tokMins();if(_tok&&m!==null&&m>1){log('Token renovado!','ok');uiToken();return;}await sleep(600);}
-  log('Renovação automática não confirmada — retentando...','warn');
-  syncTok();
+  if(!document.querySelector('.aa-ov')){
+    const v=await modal({tipo:'warn',icone:'\ud83d\udd10',titulo:'Token expirado',mensagem:'Clique em qualquer menu do site e depois clique em Pronto.',btns:[{t:'Pronto',v:'ok',cls:'p'},{t:'Cancelar',v:'cancel',cls:'d'}]});
+    if(v==='cancel')throw new Error('Processo cancelado: token expirado');
+    syncTok();
+  }
 }
 
 async function req(method,ep,body=null,retry=0){
@@ -917,7 +920,23 @@ async function emitirEtiquetas(fils){
   if(c!=='s')return;
   const pl=encodeURIComponent(JSON.stringify({filiais:fils,carga:S.cargaId,origem:C.OC,timestamp:Date.now()}));
   window.open(`https://script.google.com/a/macros/magazineluiza.com.br/s/AKfycbwHsUtz3myhdcLh8VdQABCMRhSmmaGRFZjAvEgr57JC2pkMr-bXamqjt5kagdsFqzF7Aw/exec?autoPrint=${pl}`,'_blank');
-  await envEmails(fils);
+  const _ipf=await _fetchItensCarga(fils);
+  await envEmails(fils,_ipf);
+}
+
+// Busca itens por filial da carga atual
+async function _fetchItensCarga(fils){
+  const ipf={};
+  if(!S.cargaId)return ipf;
+  for(const f of fils){
+    try{
+      const its=await A.itensBranch(S.cargaId,f);
+      const lst=[];
+      if(its?.length)for(const g of its)for(const it of(g.items||[]))lst.push({produto:it.itemName||it.description||'Produto',qtd:(it.separatedAssets||[]).length||1});
+      ipf[f]=lst;
+    }catch(_){ipf[f]=[];}
+  }
+  return ipf;
 }
 
 async function envEmails(fils,itensPorFilial={},rastreiosOverride=null){
