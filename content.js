@@ -2,17 +2,122 @@
 'use strict';
 if(document.getElementById('__aa__')) return;
 
-// ═══ TOKEN ════════════════════════════════════════════
+// ═══ TOKEN — RENOVAÇÃO AUTOMÁTICA SILENCIOSA ══════════
 let _tok=null,_tokTs=0;
-function syncTok(){const t=window.__MGT__;if(t&&t!==_tok){_tok=t;_tokTs=window.__MGTS__||Date.now();uiToken();}}
-window.addEventListener('__mgt__',e=>{_tok=e.detail;_tokTs=Date.now();uiToken();});
+let _tokenRenovando=false;
+let _tokenSessaoExpirou=false; // true quando sessão morreu e precisa de ação manual
+let _tokenUltimoErro=0;        // timestamp do último erro, pra não ficar em loop
+
+function syncTok(){
+  const t=window.__MGT__;
+  if(t&&t!==_tok){
+    _tok=t;_tokTs=window.__MGTS__||Date.now();
+    // Se tinha sessão expirada, limpa o flag — usuário agiu no site
+    if(_tokenSessaoExpirou){
+      _tokenSessaoExpirou=false;
+      _tokenUltimoErro=0;
+      log('Sessão restaurada ✓','ok');
+    }
+    uiToken();
+  }
+}
+window.addEventListener('__mgt__',e=>{
+  _tok=e.detail;_tokTs=Date.now();
+  _tokenSessaoExpirou=false;_tokenUltimoErro=0;
+  uiToken();
+});
 setInterval(syncTok,800);
 function getTok(){return _tok;}
 function tokMins(){
-  try{const p=_tok.replace('Bearer ','').split('.');if(p.length!==3)return null;
+  try{const p=(_tok||'').replace('Bearer ','').split('.');if(p.length!==3)return null;
   const pl=JSON.parse(atob(p[1]));return pl.exp?Math.round((pl.exp*1000-Date.now())/60000):null;}
   catch{return null;}
 }
+
+// Renovação silenciosa via iframe
+async function _renovarTokenSilencioso(){
+  if(_tokenRenovando) return false;
+  // Se sessão está morta, não tenta de novo por 5 minutos
+  if(_tokenSessaoExpirou && Date.now()-_tokenUltimoErro < 5*60*1000) return false;
+  _tokenRenovando=true;
+  try{
+    const code=await new Promise((resolve,reject)=>{
+      const state=Math.random().toString(36).slice(2)+Math.random().toString(36).slice(2);
+      const iframe=document.createElement('iframe');
+      iframe.style.cssText='display:none;position:fixed;top:-9999px;';
+      document.body.appendChild(iframe);
+      const timeout=setTimeout(()=>{
+        try{document.body.removeChild(iframe);}catch(_){}
+        reject(new Error('Timeout ao renovar token'));
+      },20000);
+      const monitor=setInterval(()=>{
+        try{
+          const url=iframe.contentWindow.location.href;
+          // Detecta se foi redirecionado pro login — sessão expirou
+          if(url.includes('baap-sso-login')||url.includes('/login')){
+            clearInterval(monitor);clearTimeout(timeout);
+            try{document.body.removeChild(iframe);}catch(_){}
+            reject(new Error('SESSAO_EXPIROU'));
+            return;
+          }
+          const c=url.match(/code=([a-f0-9-]+)/)?.[1];
+          if(c){clearInterval(monitor);clearTimeout(timeout);try{document.body.removeChild(iframe);}catch(_){}resolve(c);}
+        }catch(_){}
+      },50);
+      iframe.src=`https://baap-sso-api.magazineluiza.com.br/auth?application_id=61df0c4efa2156a81962dd3c&url_callback=https://gestaoativos.magazineluiza.com.br&state=${state}`;
+    });
+    const res=await fetch(`https://baap-sso-api.magazineluiza.com.br/token/${code}`,{credentials:'include',headers:{'accept':'application/json, text/plain, */*'}});
+    const data=await res.json();
+    if(data?.value?.access_token){
+      _tok='Bearer '+data.value.access_token;
+      _tokTs=Date.now();
+      window.__MGT__=_tok;
+      window.__MGTS__=_tokTs;
+      _tokenSessaoExpirou=false;
+      _tokenUltimoErro=0;
+      uiToken();
+      log('Token renovado automaticamente ✓','ok');
+      return true;
+    }
+  }catch(e){
+    if(e.message==='SESSAO_EXPIROU'){
+      // Sessão morreu — avisa uma vez e para de tentar
+      if(!_tokenSessaoExpirou){
+        log('Sessão expirou — clique em qualquer menu do portal para restaurar','warn');
+        uiToken();
+      }
+      _tokenSessaoExpirou=true;
+      _tokenUltimoErro=Date.now();
+    } else {
+      // Timeout — tenta mais uma vez silenciosamente antes de desistir
+      _tokenRenovando=false;
+      const retry=await _renovarTokenSilencioso();
+      if(!retry) _tokenUltimoErro=Date.now();
+      return retry;
+    }
+  }finally{
+    _tokenRenovando=false;
+  }
+  return false;
+}
+
+// Verifica e renova token se necessário — chamado antes de cada operação importante
+async function ensureToken(){
+  const m=tokMins();
+  // Só renova se token existe, expiração é legível E está perto de acabar
+  if(_tok && m!==null && m<2){
+    await _renovarTokenSilencioso();
+  }
+}
+
+// Auto-renovação — checa a cada 1 minuto
+setInterval(async()=>{
+  const m=tokMins();
+  // Só renova se token existe, expiração é legível E está perto de acabar
+  if(_tok && m!==null && m<=1){
+    await _renovarTokenSilencioso();
+  }
+},60000);
 
 // ═══ HELPERS ══════════════════════════════════════════
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -43,19 +148,19 @@ function setRes(f,p,status,motivo='',qtd=0){S.results[norm(f)+'::'+p.toUpperCase
 // ═══ API ══════════════════════════════════════════════
 async function _refreshOn401(){
   log('Token expirou (401) — renovando...','warn');
-  const lnk=document.querySelectorAll('nav a,.sidebar a,[class*="nav"] a,[class*="menu"] a');
-  for(const a of lnk){if(a.offsetParent!==null){const h=a.getAttribute('href');if(h&&!h.startsWith('http')&&!h.startsWith('#')){try{await fetch(window.location.origin+h,{credentials:'include'});}catch(_){}break;}}}
-  try{await fetch(window.location.href,{credentials:'include'});}catch(_){}
-  const dl=Date.now()+8000;
-  while(Date.now()<dl){syncTok();const m=tokMins();if(_tok&&m!==null&&m>1){log('Token renovado!','ok');uiToken();return;}await sleep(600);}
+  // Tenta renovação silenciosa primeiro
+  const ok=await _renovarTokenSilencioso();
+  if(ok) return;
+  // Se falhou, pede pro usuário agir
   if(!document.querySelector('.aa-ov')){
-    const v=await modal({tipo:'warn',icone:'\ud83d\udd10',titulo:'Token expirado',mensagem:'Clique em qualquer menu do site e depois clique em Pronto.',btns:[{t:'Pronto',v:'ok',cls:'p'},{t:'Cancelar',v:'cancel',cls:'d'}]});
+    const v=await modal({tipo:'warn',icone:'🔑',titulo:'Token expirado',mensagem:'Não foi possível renovar automaticamente.\nClique em qualquer menu do site e depois clique em Pronto.',btns:[{t:'Pronto',v:'ok',cls:'p'},{t:'Cancelar',v:'cancel',cls:'d'}]});
     if(v==='cancel')throw new Error('Processo cancelado: token expirado');
     syncTok();
   }
 }
 
 async function req(method,ep,body=null,retry=0){
+  await ensureToken();
   const auth=getTok();
   if(!auth)throw new Error('Token não capturado — faça qualquer ação no site.');
   const res=await fetch(C.API+ep,{method,headers:{'Content-Type':'application/json','Authorization':auth},body:body?JSON.stringify(body):null});
@@ -80,6 +185,7 @@ const A={
   itensBranch:(lid,bid)=>req('GET',`/v1/expedition/load/${lid}/conference/branch/${bid}/items?originId=${C.OID}`),
   conferir:(lid,aid,tr)=>req('PUT','/v1/expedition/load/conference',{loadId:lid,assetId:aid,trackingNumber:tr||''}),
   nfe:(lid,did)=>req('POST','/v1/expedition/load/invoice',{loadId:lid,destinyId:did,originId:C.OID}),
+  detCarga:id=>req('GET',`/v1/expedition/load/${id}`),
 };
 
 // ═══ CSS ══════════════════════════════════════════════
@@ -257,7 +363,7 @@ function injectCSS(){
 .aa-mb.d{background:var(--redlt);border:1px solid rgba(239,68,68,.3);color:#fca5a5;}
 .aa-mb.d:hover{background:rgba(239,68,68,.18);}
 
-/* TABELA DE RESULTADOS (entre solicitação e separação) */
+/* TABELA DE RESULTADOS */
 .aa-res-modal{max-width:460px;width:95%;}
 .aa-res-sum{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:14px;}
 .aa-res-cell{background:var(--s2);border:1px solid var(--b1);border-radius:8px;
@@ -276,7 +382,7 @@ function injectCSS(){
 .aa-rtable .motivo{color:var(--t3);font-size:9.5px;font-family:'JetBrains Mono',monospace;}
 .aa-res-tip{font-size:11px;color:var(--t3);text-align:center;margin-bottom:12px;line-height:1.5;}
 
-/* Lista modal (cargas etc) */
+/* Lista modal */
 .aa-list-item{padding:10px 12px;border-radius:8px;border:1px solid var(--b1);background:var(--s2);
   color:var(--t1);cursor:pointer;text-align:left;font-family:'Inter',sans-serif;
   font-size:12.5px;transition:all .15s;width:100%;box-sizing:border-box;margin-bottom:5px;}
@@ -301,15 +407,13 @@ function injectCSS(){
 // ═══ PAINEL ════════════════════════════════════════════
 function buildPanel(){
   if(document.getElementById('__aa__'))return;
-  
-  // Root panel
   const root=document.createElement('div');
   root.id='__aa__';
   root.innerHTML=`
 <div class="aah">
   <div class="aah-l">
     <div class="aah-ico">📦</div>
-    <div><div class="aah-title">Auto Ativos</div><div class="aah-sub">v14 · MAGALU</div></div>
+    <div><div class="aah-title">Auto Ativos</div><div class="aah-sub">v15 · MAGALU</div></div>
   </div>
   <div class="aah-btns">
     <button class="aah-btn" id="aa-min" title="Minimizar">&#8212;</button>
@@ -338,7 +442,6 @@ function buildPanel(){
         <option value="full">🔄 Processo Completo</option>
         <option value="sep">⚡ A partir da Separação</option>
         <option value="carga">📦 A partir da Carga</option>
-        <option value="conf">🔍 Somente Conferência</option>
       </select>
       <span class="aa-sa">▾</span>
     </div>
@@ -366,55 +469,46 @@ function buildPanel(){
 </div>`;
   document.body.appendChild(root);
 
-  // Tab flutuante
   const tab=document.createElement('button');
   tab.id='__aa_tab__';
   tab.innerHTML='<i>AUTO</i>';
   document.body.appendChild(tab);
 
-  // Body margin
-  function setMargin(w){ document.body.style.setProperty('margin-right',w,'important'); }
+  function setMargin(w){document.body.style.setProperty('margin-right',w,'important');}
   setMargin('340px');
   document.body.style.transition='margin-right .28s';
 
-  // ── FECHAR ──────────────────────────────────────────
-  // Usa addEventListener em vez de onclick pra garantir
-  document.getElementById('aa-close').addEventListener('click', function(e){
+  document.getElementById('aa-close').addEventListener('click',function(e){
     e.stopPropagation();
     root.classList.add('off');
     tab.style.display='flex';
     setMargin('0');
   });
 
-  tab.addEventListener('click', function(){
+  tab.addEventListener('click',function(){
     root.classList.remove('off');
     tab.style.display='none';
     setMargin('340px');
   });
 
-  // ── MINIMIZAR ───────────────────────────────────────
-  // Minimizar = esconde tudo menos o header
   let mini=false;
   const minBtn=document.getElementById('aa-min');
-  minBtn.addEventListener('click', function(e){
+  minBtn.addEventListener('click',function(e){
     e.stopPropagation();
     mini=!mini;
-    // Mostra/esconde as partes internas exceto header e token
     const parts=root.querySelectorAll('.aas, .aa-log');
-    parts.forEach(el=>{ el.style.display=mini?'none':''; });
+    parts.forEach(el=>{el.style.display=mini?'none':'';});
     const tok=root.querySelector('.aat');
-    if(tok) tok.style.display=mini?'none':'';
-    // Ajusta altura e margem
+    if(tok)tok.style.display=mini?'none':'';
     root.style.height=mini?'52px':'100vh';
     setMargin(mini?'0':'340px');
     minBtn.innerHTML=mini?'&#9633;':'&#8212;';
     minBtn.title=mini?'Restaurar':'Minimizar';
   });
 
-  // Binds restantes
   document.getElementById('aa-run').addEventListener('click',start);
   document.getElementById('aa-stop').addEventListener('click',()=>{
-    S.stop=true; setSt('Parada solicitada...'); log('Interrompido pelo usuário.','warn');
+    S.stop=true;setSt('Parada solicitada...');log('Interrompido pelo usuário.','warn');
   });
   document.getElementById('aa-email').addEventListener('click',testarEmails);
   document.getElementById('aa-sheets').addEventListener('click',()=>{
@@ -431,7 +525,7 @@ function buildPanel(){
   document.getElementById('aa-lclr').addEventListener('click',e=>{
     e.stopPropagation();
     document.getElementById('aa-lb').innerHTML='';
-    _lc=0; document.getElementById('aa-lc').textContent='0';
+    _lc=0;document.getElementById('aa-lc').textContent='0';
   });
 
   setInterval(uiToken,8000);
@@ -442,21 +536,22 @@ function uiToken(){
   const tx=document.getElementById('aa-tok-txt');
   if(!el||!tx)return;
   if(!getTok()){el.className='aat w';tx.textContent='Aguardando token — faça qualquer ação no site';return;}
+  if(_tokenSessaoExpirou){el.className='aat w';tx.textContent='Sessão expirou — clique em qualquer menu do portal';return;}
   const m=tokMins();
-  if(m!==null&&m<2){el.className='aat ex';tx.textContent=`Token expirando em ${m}min — renove agora`;}
+  if(m!==null&&m<2){el.className='aat ex';tx.textContent=`Token expirando em ${m}min — renovando...`;}
   else{el.className='aat ok';tx.textContent=m!==null?`Token ativo · ${m} min restantes`:'Token ativo';}
 }
 
 // ═══ UI HELPERS ════════════════════════════════════════
 function setSt(t,on=true){
   const el=document.getElementById('aa-st');
-  if(!el)return; el.textContent=t; el.className='aa-st'+(on?' on':'');
+  if(!el)return;el.textContent=t;el.className='aa-st'+(on?' on':'');
 }
 function setProg(p){
   const w=document.getElementById('aa-pw'),b=document.getElementById('aa-pb');
   if(!w||!b)return;
   if(p===null){w.classList.remove('on');return;}
-  w.classList.add('on'); b.style.width=p+'%';
+  w.classList.add('on');b.style.width=p+'%';
 }
 let _lc=0;
 function log(msg,type='info'){
@@ -468,7 +563,7 @@ function log(msg,type='info'){
   const d=document.createElement('div');
   d.className='aa-le '+type;
   d.textContent=`${icons[type]||'›'} ${t}  ${msg}`;
-  lb.appendChild(d); lb.scrollTop=lb.scrollHeight;
+  lb.appendChild(d);lb.scrollTop=lb.scrollHeight;
   if(lb.children.length>200)lb.removeChild(lb.children[0]);
 }
 
@@ -488,7 +583,7 @@ function modal(cfg){
     h+='<div class="aa-m-btns">';
     (cfg.btns||[]).forEach(b=>{h+=`<button class="aa-mb ${b.cls||'s'}" data-v="${b.v}">${b.t}</button>`;});
     h+='</div>';
-    m.innerHTML=h; ov.appendChild(m); document.body.appendChild(ov);
+    m.innerHTML=h;ov.appendChild(m);document.body.appendChild(ov);
     m.querySelectorAll('[data-v]').forEach(btn=>{btn.addEventListener('click',()=>{ov.remove();res(btn.dataset.v);});});
     ov.addEventListener('click',e=>{if(e.target===ov){ov.remove();res(null);}});
   });
@@ -524,8 +619,7 @@ function listaModal(cfg){
     cfg.itens.forEach((item,i)=>{
       h+=`<button class="aa-list-item" data-i="${i}">
 <strong>${item.t}</strong><span style="margin-left:8px">${item.s||''}</span>
-${item.d?`<small>${item.d}</small>`:''}
-</button>`;
+${item.d?`<small>${item.d}</small>`:''}</button>`;
     });
     h+=`</div><button class="aa-mb s" id="__aalc__">Cancelar</button>`;
     m.innerHTML=h;ov.appendChild(m);document.body.appendChild(ov);
@@ -534,24 +628,17 @@ ${item.d?`<small>${item.d}</small>`:''}
   });
 }
 
-// ═══ MODAL RESUMO SOLICITAÇÃO (NOVO!) ═══════════════════
-// Aparece entre a etapa de Solicitação e a Separação
-// Mostra tabela ok/fail → usuário vê o que riscar do papel
+// ═══ MODAL RESUMO SOLICITAÇÃO ══════════════════════════
 async function modalResumoSolicitacao(){
   const results=Object.values(S.results);
   const oks=results.filter(r=>r.status==='ok');
   const fails=results.filter(r=>r.status==='fail');
-
-  // Monta a tabela
   let tabHTML=`<table class="aa-rtable">
 <thead><tr><th>Filial</th><th>Produto</th><th>Qtd</th><th>Status</th></tr></thead><tbody>`;
-  // Ordeia: oks primeiro, depois fails
   const ordered=[...oks,...fails];
   for(const r of ordered){
     const cls=r.status==='ok'?'ok':'fail';
-    const tag=r.status==='ok'
-      ?`<span class="tag-ok">✓ OK</span>`
-      :`<span class="tag-fail">✗ Falhou</span>`;
+    const tag=r.status==='ok'?`<span class="tag-ok">✓ OK</span>`:`<span class="tag-fail">✗ Falhou</span>`;
     tabHTML+=`<tr class="${cls}"><td><strong>${r.f}</strong></td>
 <td style="font-family:'JetBrains Mono',monospace;font-size:10.5px">${r.p}</td>
 <td style="font-family:'JetBrains Mono',monospace;font-size:11px">${r.status==='ok'?'×'+r.qtd:'—'}</td>
@@ -561,21 +648,19 @@ async function modalResumoSolicitacao(){
     }
   }
   tabHTML+='</tbody></table>';
-
   const tip=fails.length>0
     ?`<div class="aa-res-tip">⚠️ Riscando do papel: <strong style="color:#fcd34d">${fails.map(f=>f.f).join(', ')}</strong> não precisam ser bipadas.</div>`
     :`<div class="aa-res-tip" style="color:#86efac">✓ Todas as filiais foram enviadas com sucesso!</div>`;
-
   const v=await modal({
-    icone: oks.length>0&&fails.length===0?'🎯':'📋',
+    icone:oks.length>0&&fails.length===0?'🎯':'📋',
     titulo:'Resultado das Solicitações',
-    tipo: fails.length>0?'warn':'ok',
+    tipo:fails.length>0?'warn':'ok',
     wide:'aa-res-modal',
     html:`
 <div class="aa-res-sum">
   <div class="aa-res-cell"><div class="aa-res-val" style="color:#93c5fd">${results.length}</div><div class="aa-res-lbl">Total</div></div>
   <div class="aa-res-cell"><div class="aa-res-val" style="color:var(--green)">${oks.length}</div><div class="aa-res-lbl">OK</div></div>
-  <div class="aa-res-cell"><div class="aa-res-val" style="color:${fails.length?'var(--red)':'var(--green)'}">${fails.length}</div><div class="aa-res-lbl">Falhas</div></div>
+  <div class="aa-res-cell"><div class="aa-res-val" style="color:${fails.length?'var(--red)':'var(--green)'}">  ${fails.length}</div><div class="aa-res-lbl">Falhas</div></div>
 </div>
 ${tip}
 <div style="max-height:200px;overflow-y:auto;border:1px solid var(--b1);border-radius:8px;margin-bottom:12px;">
@@ -595,14 +680,14 @@ async function start(){
   const jobs=parseFiliais(raw);
   const mode=document.getElementById('aa-mode')?.value||'full';
   if(!getTok()){
-    await modal({tipo:'err',icone:'🔐',titulo:'Token não capturado',mensagem:'Faça qualquer ação no site (clique em Recebimento, Expedição, etc.) para o token ser capturado.', btns:[{t:'Entendido',v:'ok',cls:'p'}]});
+    await modal({tipo:'err',icone:'🔐',titulo:'Token não capturado',mensagem:'Faça qualquer ação no site (clique em Recebimento, Expedição, etc.) para o token ser capturado.',btns:[{t:'Entendido',v:'ok',cls:'p'}]});
     return;
   }
   if(!jobs.length){
     await modal({tipo:'err',icone:'📝',titulo:'Nenhuma filial',mensagem:'Informe ao menos uma filial no campo acima.',btns:[{t:'Ok',v:'ok',cls:'p'}]});
     return;
   }
-  const mLabel={full:'COMPLETO',sep:'SEPARAÇÃO',carga:'CARGA',conf:'CONFERÊNCIA'};
+  const mLabel={full:'COMPLETO',sep:'SEPARAÇÃO',carga:'CARGA'};
   Object.assign(S,{running:true,stop:false,jobs,results:{},sentItems:[],sepFiliais:[],jobsOk:[],sepAssets:[],
     cargaId:null,cargaOk:false,freight:null,depDate:null,
     confOk:0,confErr:0,confFilOk:[],confFilErr:[],tracks:{},
@@ -618,39 +703,44 @@ async function start(){
     if(mode==='full'){
       setSt('Etapa 1 — Solicitações');setProg(10);
       await stepSolicitacao();
-
-      // ▶ AQUI: mostra resumo antes de continuar ◀
       if(!S.stop){
         const oks=Object.values(S.results).filter(r=>r.status==='ok');
         if(oks.length>0){
           const dec=await modalResumoSolicitacao();
           if(dec==='stop'||dec===null){S.stop=true;}
-        } else {
+        }else{
           await modal({tipo:'err',icone:'😔',titulo:'Nenhuma solicitação processada',mensagem:'Nenhuma filial teve itens enviados para separação.\n\nVerifique os dados e tente novamente.',btns:[{t:'Ok',v:'ok',cls:'p'}]});
           S.stop=true;
         }
       }
-
       if(!S.stop&&S.jobsOk.length){setSt('Etapa 2 — Separação');setProg(28);await stepSeparacao();if(!S.stop)await stepBuscarSep();}
       if(!S.stop&&S.sepAssets.length){setSt('Etapa 3 — Carga');setProg(50);await stepCarga();}
       if(!S.stop&&S.cargaId&&S.cargaOk){setSt('Etapa 4 — Conferência');setProg(68);await stepConferencia();}
-    } else if(mode==='sep'){
+    }else if(mode==='sep'){
       S.jobsOk=[...jobs];S.sepFiliais=[...new Set(jobs.map(j=>j.filial))];
       await stepSeparacao();if(!S.stop)await stepBuscarSep();
       if(!S.stop&&S.sepAssets.length)await stepCarga();
       if(!S.stop&&S.cargaId&&S.cargaOk)await stepConferencia();
-    } else if(mode==='carga'){
+    }else if(mode==='carga'){
       S.sepFiliais=[...new Set(jobs.map(j=>j.filial))];
       await stepBuscarSep();
       if(!S.stop&&S.sepAssets.length)await stepCarga();
       if(!S.stop&&S.cargaId&&S.cargaOk)await stepConferencia();
-    } else if(mode==='conf'){
-      const id=await prompt2({icone:'📦',titulo:'Número da Carga',mensagem:'ID da carga para conferir:',ph:'Ex: 12345'});
-      if(id&&!isNaN(parseInt(id))){S.cargaId=parseInt(id);S.cargaOk=true;await stepConferencia();}
     }
-  } catch(e){
+  }catch(e){
     log(`Erro fatal: ${e.message}`,'err');
     setSt(`Erro: ${e.message}`,true);
+  }finally{
+    // Garante que o e-mail seja sempre enviado ao final, independente de erros
+    if(S.cargaId&&!S.stop){
+      try{
+        const fils=[...new Set([...S.confFilOk,...S.confFilErr,...S.sepFiliais].map(f=>norm(f)).filter(Boolean))];
+        if(fils.length){
+          const ipf=await _fetchItensCarga(fils);
+          await envEmails(fils,ipf);
+        }
+      }catch(e){log('Erro ao enviar e-mails finais: '+e.message,'err');}
+    }
   }
 
   S.running=false;
@@ -701,10 +791,10 @@ async function stepSolicitacao(){
         S.jobsOk.push(job);if(!S.sepFiliais.includes(job.filial))S.sepFiliais.push(job.filial);
         setRes(job.filial,job.prod,'ok',`${total} item(s) enviados`,total);
         log(`✓ Filial ${job.filial}: ${total} item(s) ok.`,'ok');
-      } else if(!found){
+      }else if(!found){
         setRes(job.filial,job.prod,'fail',`"${job.prod}" não encontrado nas solicitações pendentes`);
         log(`Filial ${job.filial}: "${job.prod}" não encontrado.`,'warn');
-      } else {
+      }else{
         setRes(job.filial,job.prod,'fail','Produto encontrado mas falhou ao enviar');
         log(`Filial ${job.filial}: erro ao enviar.`,'err');
       }
@@ -801,8 +891,10 @@ async function stepCarga(){
   const la=S.sepAssets.map(a=>({separatedAssetId:a.separatedAssetId}));
   const op=await modal({icone:'🚚',titulo:'Opção de Carga',mensagem:`${la.length} ativo(s) prontos.\n\nComo deseja prosseguir?`,btns:[{t:'➕ Nova Carga',v:'new',cls:'p'},{t:'📋 Carga Existente',v:'ex'}]});
   if(!op)return;
-  try{op==='ex'?await addCargaEx(la):await novaCarga(la);}
-  catch(e){
+  try{
+    if(op==='ex')await addCargaEx(la);
+    else await novaCarga(la);
+  }catch(e){
     log(`Erro carga: ${e.message}`,'err');
     const id=await prompt2({icone:'⚠️',titulo:'Erro na API',mensagem:'Digite o ID da carga manualmente:',ph:'ID...'});
     if(id&&!isNaN(parseInt(id))){S.cargaId=parseInt(id);log(`Carga ${id} manual.`,'warn');}
@@ -815,7 +907,11 @@ async function addCargaEx(la){
   if(!cs.length)return novaCarga(la);
   const idx=await listaModal({icone:'📋',titulo:'Selecionar Carga',itens:cs.map(c=>({t:`Carga #${c.id}`,s:`${c.freightType||'?'} · ${c.date?c.date.split('T')[0]:'?'}`,d:c.destinationsCode||''}))});
   if(idx===null)return;
-  S.cargaId=cs[idx].id;
+  const cargaSel=cs[idx];
+  S.cargaId=cargaSel.id;
+  // Pega os dados da carga existente pra usar no e-mail
+  S.freight=cargaSel.freightType||'DEDICATED';
+  S.depDate=cargaSel.departureDate||cargaSel.date||'';
   await A.addCarga(S.cargaId,C.OC,la);
   log(`✓ ${la.length} ativo(s) → carga #${S.cargaId}`,'ok');
   const c=await modal({tipo:'ok',titulo:'Ativos adicionados!',mensagem:`Carga #${S.cargaId}\n${la.length} ativos.\n\nConferir agora?`,btns:[{t:'Não',v:'n'},{t:'Sim',v:'s',cls:'p'}]});
@@ -826,16 +922,23 @@ async function novaCarga(la){
   const r=await A.criarCarga(C.OC,la);
   S.cargaId=r?.loadId||r?.id;if(!S.cargaId)throw new Error('API não retornou loadId');
   log(`✓ Carga #${S.cargaId} criada!`,'ok');
-  const tp=await prompt2({icone:'🚚',titulo:'Tipo de Frete',mensagem:'D = DEDICADO\nC = CORREIOS',ph:'D ou C'});
+  // Tipo de frete — agora com ABA
+  const tp=await prompt2({icone:'🚚',titulo:'Tipo de Frete',mensagem:'D = DEDICADO\nC = CORREIOS\nA = ABA',ph:'D, C ou A'});
   if(!tp){log('Carga criada, não enviada.','warn');return;}
-  const ft=tp.trim().toUpperCase().startsWith('C')?'CORREIOS':'DEDICATED';S.freight=ft;
+  let ft='DEDICATED';
+  const tpu=tp.trim().toUpperCase();
+  if(tpu.startsWith('C'))ft='CORREIOS';
+  else if(tpu.startsWith('A'))ft='ABA';
+  else ft='DEDICATED';
+  S.freight=ft;
   const agora=new Date();
   const dh=await prompt2({icone:'📅',titulo:'Data e Hora da Saída',mensagem:'Formato: YYYY-MM-DD HH:MM\n(em branco = amanhã 08:00)',ph:`${agora.toISOString().split('T')[0]} 08:00`});
   let dd;
   if(!dh){const t=new Date();t.setDate(t.getDate()+1);t.setHours(8,0,0,0);dd=t.toISOString().slice(0,19);}
   else{const pts=dh.trim().split(/[\s,]+/);dd=`${pts[0]}T${pts[1]||'08:00'}:00`;}
   S.depDate=dd;
-  const c=await modal({tipo:'info',icone:'📤',titulo:'Confirmar Envio',mensagem:`Carga: #${S.cargaId}\nTipo: ${ft}\nSaída: ${dd.replace('T',' ')}\nAtivos: ${la.length}`,btns:[{t:'Cancelar',v:'n'},{t:'Enviar',v:'s',cls:'p'}]});
+  const freteLabel=ft==='CORREIOS'?'Correios':ft==='ABA'?'ABA':'Dedicado';
+  const c=await modal({tipo:'info',icone:'📤',titulo:'Confirmar Envio',mensagem:`Carga: #${S.cargaId}\nTipo: ${freteLabel}\nSaída: ${dd.replace('T',' ')}\nAtivos: ${la.length}`,btns:[{t:'Cancelar',v:'n'},{t:'Enviar',v:'s',cls:'p'}]});
   if(c!=='s'){log('Envio cancelado.','warn');return;}
   await A.enviarCarga(S.cargaId,ft,dd);S.cargaOk=true;log(`✓ Carga #${S.cargaId} enviada!`,'ok');
 }
@@ -844,7 +947,19 @@ async function stepConferencia(){
   log('── CONFERÊNCIA ──','info');
   const lid=S.cargaId;
   const ci=await A.filsCarga(lid);if(!ci){log('Sem info da carga.','err');return;}
-  const isCorr=ci.freightType==='CORREIOS';
+
+  // Se ainda não temos freight/depDate (modo carga com carga existente), busca da API
+  if(!S.freight||!S.depDate){
+    try{
+      const det=await A.detCarga(lid);
+      if(det){
+        S.freight=S.freight||det.freightType||'DEDICATED';
+        S.depDate=S.depDate||det.departureDate||det.date||'';
+      }
+    }catch(e){log('Não foi possível buscar dados da carga: '+e.message,'warn');}
+  }
+
+  const isCorr=ci.freightType==='CORREIOS'||(S.freight==='CORREIOS');
   const fils=[];const _seen=new Set();
   for(const s of(ci.stockCd||[]))for(const b of(s.branches||[])){const id=b.number||b.branchId;if(id&&b.status==='PENDING'){const _n=String(id).replace(/\D/g,'').replace(/^0+/,'')||'0';if(!_seen.has(_n)){_seen.add(_n);fils.push({branchId:id});}}}
   const ord=S.jobs.map(j=>norm(j.filial));
@@ -858,16 +973,13 @@ async function stepConferencia(){
         tr=await prompt2({icone:'📮',titulo:`Rastreio — Filial ${f.branchId}`,mensagem:`Código obrigatório para filial ${f.branchId}:`,ph:'AA123456789BR'});
         if(!tr){const d=await modal({tipo:'err',titulo:'Rastreio obrigatório',mensagem:'Sem rastreio não é possível continuar.',btns:[{t:'🛑 Abortar',v:'abort',cls:'d'},{t:'🔄 Tentar',v:'retry',cls:'p'}]});if(d==='abort')throw new Error('Conferência cancelada: sem rastreio');}
       }
-      // Salva com todas as variações da chave para garantir match no Apps Script
-      const _raw = String(f.branchId).replace(/\D/g,'');
-      const _norm = _raw.replace(/^0+/,'');           // "1016"
-      const _pad3 = _norm.padStart(3,'0');             // "1016" (já tem 4 digs)
-      const _pad4 = _norm.padStart(4,'0');             // "1016"
-      S.tracks[f.branchId] = tr;  // chave original da API
-      S.tracks[_raw]  = tr;       // sem processamento
-      S.tracks[_norm] = tr;       // sem zeros à esquerda
-      S.tracks[_pad3] = tr;       // 3 dígitos
-      S.tracks[_pad4] = tr;       // 4 dígitos
+      const _raw=String(f.branchId).replace(/\D/g,'');
+      const _norm=_raw.replace(/^0+/,'');
+      S.tracks[f.branchId]=tr;
+      S.tracks[_raw]=tr;
+      S.tracks[_norm]=tr;
+      S.tracks[_norm.padStart(3,'0')]=tr;
+      S.tracks[_norm.padStart(4,'0')]=tr;
       log(`Rastreio filial ${_norm}: ${tr}`,'ok');
     }
   }
@@ -933,7 +1045,7 @@ async function _fetchItensCarga(fils){
       const its=await A.itensBranch(S.cargaId,f);
       const lst=[];
       if(its?.length)for(const g of its)for(const it of(g.items||[]))lst.push({produto:it.itemName||it.description||'Produto',qtd:(it.separatedAssets||[]).length||1});
-      ipf[f]=lst;
+      ipf[f]=lst.length?lst:[{produto:'Produto não identificado',qtd:1}];
     }catch(_){ipf[f]=[];}
   }
   return ipf;
@@ -943,22 +1055,20 @@ async function envEmails(fils,itensPorFilial={},rastreiosOverride=null){
   if(!fils?.length)return;
   log(`E-mails para ${fils.length} filial(is)...`,'info');
   const APPS_URL='https://script.google.com/macros/s/AKfycbxhXM_SZyYON_Ue2xh0PMD_nqiywwS_zIqKAdGP0rHGe9nENgeKP1lKOJdQHeSPTSsuxw/exec';
-  // Se foi passado rastreiosOverride (botão testar), usa ele. Senão pega do S.tracks.
   const rastreiosNorm={};
   for(const f of fils){
     const fn=String(f).replace(/\D/g,'').replace(/^0+/,'')||'0';
     let tr=null;
     if(rastreiosOverride){
       tr=rastreiosOverride[fn]||rastreiosOverride[f]||null;
-    } else {
+    }else{
       tr=S.tracks[f]||S.tracks[fn]
         ||S.tracks[fn.padStart(3,'0')]||S.tracks[fn.padStart(4,'0')]
         ||S.tracks[fn.padStart(5,'0')]||S.tracks['0'+fn]||null;
     }
-    if(tr) rastreiosNorm[fn]=tr;
+    if(tr)rastreiosNorm[fn]=tr;
   }
   const payload=JSON.stringify({acao:'enviarEmails',filiais:fils,carga:S.cargaId,freightType:S.freight||'DEDICATED',departureDate:S.depDate||'',rastreios:rastreiosNorm,itensPorFilial});
-  // XHR com no-cors funciona melhor que fetch em extensoes Chrome com Apps Script
   return new Promise(resolve=>{
     const xhr=new XMLHttpRequest();
     xhr.open('POST',APPS_URL,true);
@@ -969,18 +1079,16 @@ async function envEmails(fils,itensPorFilial={},rastreiosOverride=null){
         if(j.ok)log(`✓ E-mails enviados: ${(j.enviados||fils).join(', ')}${j.erros?.length?' | Erros: '+j.erros.map(e=>e.filial).join(','):''}`,'ok');
         else log(`Apps Script erro: ${j.erro}`,'err');
       }catch(_){
-        // no-cors retorna status 0 e sem body - normal
         log(`E-mails disparados para: ${fils.join(', ')} (sem confirmação - verifique Apps Script)`,'ok');
       }
       resolve();
     };
     xhr.onerror=()=>{
       log(`Erro de rede ao enviar e-mails. Tentando GET...`,'warn');
-      // Fallback: GET com params basicos (Apps Script aceita doGet tambem)
       const params=new URLSearchParams({acao:'enviarEmails',filiais:fils.join(','),carga:String(S.cargaId||''),freightType:S.freight||'DEDICATED',departureDate:S.depDate||''});
       const w=window.open(APPS_URL+'?'+params.toString(),'_blank');
       setTimeout(()=>{try{w&&w.close();}catch(_){}},5000);
-      log('Fallback GET disparado (aba abre e fecha).','warn');
+      log('Fallback GET disparado.','warn');
       resolve();
     };
     xhr.send(payload);
@@ -997,47 +1105,37 @@ async function testarEmails(){
   const ci=await A.filsCarga(ch.id);
   let fils=[];for(const s of(ci?.stockCd||[]))for(const b of(s.branches||[])){const id=b.number||b.branchId;if(id){const _n=String(id).replace(/\D/g,'').replace(/^0+/,'')||'0';fils.push(_n);}}fils=[...new Set(fils)];
   if(!fils.length){log('Sem filiais.','warn');return;}
-  const ipf={};
-  for(const f of fils){try{const its=await A.itensBranch(ch.id,f);const lst=[];if(its?.length)for(const g of its)for(const it of(g.items||[]))lst.push({produto:it.itemName||it.description||'Produto',qtd:(it.separatedAssets||[]).length||1});ipf[f]=lst;}catch{ipf[f]=[];}}
+  const ipf=await _fetchItensCarga(fils);
   const c=await modal({tipo:'info',icone:'📧',titulo:'Confirmar',mensagem:`Carga #${ch.id} · ${ch.freightType}\nFiliais (${fils.length}): ${fils.join(', ')}\n\nIsso enviará e-mails REAIS.`,btns:[{t:'Cancelar',v:'n'},{t:'Enviar',v:'s',cls:'p'}]});
   if(c!=='s')return;
 
-  // Coleta rastreios: tenta buscar automaticamente da API, só pede manualmente se não encontrar
   const rastreiosEmail={};
   if(ch.freightType==='CORREIOS'){
-    log('Buscando códigos de rastreio da carga automaticamente...','info');
+    log('Buscando códigos de rastreio automaticamente...','info');
     for(const f of fils){
       const fn=String(f).replace(/\D/g,'').replace(/^0+/,'')||'0';
       let trEncontrado=null;
-
-      // Tenta extrair trackingNumber dos ativos já conferidos via API
       try{
-        // itensBranch já foi chamado antes para montar ipf — reutiliza a mesma rota
         const its=await A.itensBranch(ch.id,f);
         if(its?.length){
           outer:for(const g of its){
             for(const it of(g.items||[])){
               for(const asset of(it.separatedAssets||[])){
                 const tr=asset.trackingNumber||asset.tracking||asset.trackCode||null;
-                if(tr&&String(tr).trim()&&String(tr).trim()!=='null'){
-                  trEncontrado=String(tr).trim();
-                  break outer;
-                }
+                if(tr&&String(tr).trim()&&String(tr).trim()!=='null'){trEncontrado=String(tr).trim();break outer;}
               }
             }
           }
         }
       }catch(e){log(`Erro ao buscar rastreio filial ${fn}: ${e.message}`,'warn');}
-
       if(trEncontrado){
         rastreiosEmail[fn]=trEncontrado;
-        log(`✓ Rastreio filial ${fn}: ${trEncontrado} (identificado automaticamente)`,'ok');
-      } else {
-        // Fallback manual — só pergunta se não achou na API
-        log(`Rastreio não encontrado automaticamente para filial ${fn}, solicitando manualmente...`,'warn');
+        log(`✓ Rastreio filial ${fn}: ${trEncontrado}`,'ok');
+      }else{
+        log(`Rastreio não encontrado para filial ${fn}, solicitando manualmente...`,'warn');
         let tr=null;
         while(!tr){
-          tr=await prompt2({icone:'📮',titulo:`Rastreio — Filial ${fn}`,mensagem:`Não foi possível identificar o rastreio automaticamente.\n\nDigite o código para filial ${fn}:`,ph:'AA123456789BR'});
+          tr=await prompt2({icone:'📮',titulo:`Rastreio — Filial ${fn}`,mensagem:`Digite o código para filial ${fn}:`,ph:'AA123456789BR'});
           if(!tr){
             const d=await modal({tipo:'err',titulo:'Rastreio obrigatório',mensagem:`Sem rastreio a filial ${fn} não receberá o código no e-mail.`,btns:[{t:'Pular esta filial',v:'skip',cls:'d'},{t:'Digitar',v:'retry',cls:'p'}]});
             if(d==='skip'){tr='(não informado)';break;}
@@ -1048,7 +1146,6 @@ async function testarEmails(){
       }
     }
   }
-
   await envEmails(fils,ipf,rastreiosEmail);
 }
 
@@ -1060,12 +1157,11 @@ async function finalModal(){
   const dur=S.startTime?Math.round((Date.now()-S.startTime)/1000):0;
   const mm=Math.floor(dur/60),ss=dur%60;
   const rks=Object.keys(S.tracks||{});
-  
   let resTable='';
   if(results.length>0){
     resTable=`<div style="max-height:160px;overflow-y:auto;border:1px solid var(--b1);border-radius:8px;margin-bottom:10px;">
 <table class="aa-rtable"><thead><tr><th>Filial</th><th>Produto</th><th>Status</th></tr></thead><tbody>`;
-    for(const r of [...oks,...fails]){
+    for(const r of[...oks,...fails]){
       const cls=r.status==='ok'?'ok':'fail';
       const tag=r.status==='ok'?`<span class="tag-ok">✓ ×${r.qtd}</span>`:`<span class="tag-fail">✗ Falhou</span>`;
       resTable+=`<tr class="${cls}"><td><strong>${r.f}</strong></td>
@@ -1075,9 +1171,10 @@ async function finalModal(){
   }
   let cargaInfo='';
   if(S.cargaId){
+    const freteLabel=S.freight==='CORREIOS'?'Correios':S.freight==='ABA'?'ABA':'Dedicado';
     cargaInfo=`<div class="aa-final-sec">
 <div class="aa-final-row"><span class="aa-final-k">Carga</span><span class="aa-final-v">#${S.cargaId}</span></div>
-<div class="aa-final-row"><span class="aa-final-k">Tipo</span><span class="aa-final-v">${S.freight||'N/A'}</span></div>
+<div class="aa-final-row"><span class="aa-final-k">Tipo</span><span class="aa-final-v">${freteLabel}</span></div>
 <div class="aa-final-row"><span class="aa-final-k">Conferidos</span><span class="aa-final-v" style="color:${S.confErr?'#fca5a5':'#86efac'}">${S.confOk}${S.confErr?` · ${S.confErr} erros`:' ✓'}</span></div>
 <div class="aa-final-row"><span class="aa-final-k">NF-e</span><span class="aa-final-v" style="color:${S.nfeOk?'#86efac':'#fcd34d'}">${S.nfeOk?'✓ Solicitada':'⏳ Pendente'}</span></div>
 </div>`;
@@ -1098,13 +1195,13 @@ ${rks.map(k=>`<div style="font-family:'JetBrains Mono',monospace;font-size:11px;
 <div class="aa-res-sum">
   <div class="aa-res-cell"><div class="aa-res-val" style="color:#93c5fd">${S.jobs.length}</div><div class="aa-res-lbl">Filiais</div></div>
   <div class="aa-res-cell"><div class="aa-res-val" style="color:var(--green)">${oks.length}</div><div class="aa-res-lbl">OK</div></div>
-  <div class="aa-res-cell"><div class="aa-res-val" style="color:${fails.length?'var(--red)':'var(--green)'}">${fails.length}</div><div class="aa-res-lbl">Falhas</div></div>
+  <div class="aa-res-cell"><div class="aa-res-val" style="color:${fails.length?'var(--red)':'var(--green)'}">  ${fails.length}</div><div class="aa-res-lbl">Falhas</div></div>
 </div>
 ${resTable}${cargaInfo}${rast}`,
     btns:[{t:'📋 Copiar',v:'copy'},{t:'Fechar',v:'close',cls:'p'}]
   });
   if(v==='copy'){
-    const lines=['AUTO ATIVOS v13 — '+new Date().toLocaleString('pt-BR'),`Modo: ${S.modo} · ${mm}m${ss}s`,'','=== RESULTADO POR FILIAL ==='];
+    const lines=['AUTO ATIVOS v15 — '+new Date().toLocaleString('pt-BR'),`Modo: ${S.modo} · ${mm}m${ss}s`,'','=== RESULTADO POR FILIAL ==='];
     for(const r of results){lines.push(`  ${r.f.padEnd(6)} ${r.p.padEnd(20)} ${r.status==='ok'?'✓ OK (×'+r.qtd+')':'✗ FALHOU'}`);if(r.status==='fail')lines.push(`         ${r.motivo}`);}
     if(S.cargaId){lines.push('',`=== CARGA #${S.cargaId} ===`,`Tipo: ${S.freight||'N/A'}`,`Conferidos: ${S.confOk} | Erros: ${S.confErr}`,`NF-e: ${S.nfeOk?'Solicitada':'Pendente'}`);}
     if(rks.length){lines.push('','=== RASTREIOS ===');rks.forEach(k=>lines.push(`  ${k}: ${S.tracks[k]}`));}
